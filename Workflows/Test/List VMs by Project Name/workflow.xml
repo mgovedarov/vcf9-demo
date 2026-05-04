@@ -1,0 +1,333 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ns2:workflow xmlns:ns2="http://vmware.com/vco/workflow" root-name="item1" object-name="workflow:name=generic" id="fd370e68-24bc-4bb3-96cc-1e105fc9a516" editor-version="2.0" version="0.0.1" api-version="6.0.0" restartMode="1" resumeFromFailedMode="0">
+    <display-name>List VMs by Project Name</display-name>
+    <description>List VCFA/VRA machines that belong to a project selected by project name.</description>
+    <position y="50.0" x="100.0"/>
+    <input>
+        <param name="projectName" type="string">
+            <description>Project name to match exactly, case-insensitively.</description>
+        </param>
+    </input>
+    <output>
+        <param name="vms" type="Array/Properties">
+            <description>VM records for the matched project.</description>
+        </param>
+        <param name="vmCount" type="number">
+            <description>Number of VMs matched for the project.</description>
+        </param>
+    </output>
+    <workflow-item name="item0" type="end" end-mode="0" comparator="0">
+        <in-binding/>
+        <position y="50.0" x="360.0"/>
+    </workflow-item>
+    <workflow-item name="item1" out-name="item0" throw-bind-name="" type="task" comparator="0">
+        <display-name>List VMs</display-name>
+        <script encoded="false">var requestedProjectName = projectName ? String(projectName).replace(/^\s+|\s+$/g, "") : "";
+if (!requestedProjectName) {
+    throw "projectName is required.";
+}
+
+vms = new Array();
+vmCount = 0;
+
+function toText(value) {
+    if (value === null || value === undefined) {
+        return "";
+    }
+    return String(value);
+}
+
+function normalize(value) {
+    return toText(value).replace(/^\s+|\s+$/g, "").toLowerCase();
+}
+
+function getField(object, fieldName) {
+    if (!object) {
+        return null;
+    }
+    try {
+        if (object[fieldName] !== null &amp;&amp; object[fieldName] !== undefined) {
+            return object[fieldName];
+        }
+    } catch (ignored) {}
+
+    var getter = "get" + fieldName.charAt(0).toUpperCase() + fieldName.substring(1);
+    try {
+        if (object[getter]) {
+            return object[getter]();
+        }
+    } catch (ignored) {}
+
+    return null;
+}
+
+function asArray(value) {
+    if (!value) {
+        return new Array();
+    }
+    if (value instanceof Array) {
+        return value;
+    }
+    if (value.content) {
+        return value.content;
+    }
+    if (value.items) {
+        return value.items;
+    }
+    if (value.documents) {
+        return value.documents;
+    }
+    if (typeof value.length === "number") {
+        var converted = new Array();
+        for (var i = 0; i &lt; value.length; i++) {
+            converted.push(value[i]);
+        }
+        return converted;
+    }
+    return new Array();
+}
+
+function selectHost() {
+    var hosts = Server.findAllForType("VRA:Host");
+    if (!hosts || hosts.length === 0) {
+        throw "No configured VRA:Host objects were found.";
+    }
+    hosts.sort(function(left, right) {
+        var leftName = normalize(getField(left, "name") || getField(left, "id"));
+        var rightName = normalize(getField(right, "name") || getField(right, "id"));
+        if (leftName &lt; rightName) return -1;
+        if (leftName &gt; rightName) return 1;
+        return 0;
+    });
+    return hosts[0];
+}
+
+function findProjects(host) {
+    var projects = new Array();
+    try {
+        if (typeof VraEntitiesFinder !== "undefined" &amp;&amp; VraEntitiesFinder.getProjects) {
+            projects = asArray(VraEntitiesFinder.getProjects(host));
+        }
+    } catch (finderError) {
+        System.warn("Unable to list projects with VraEntitiesFinder.getProjects: " + finderError);
+    }
+
+    if (projects.length &gt; 0) {
+        return projects;
+    }
+
+    try {
+        var projectService = host.createInfrastructureClient().createProjectService();
+        if (projectService.getProjects) {
+            return asArray(projectService.getProjects());
+        }
+        if (projectService.listProjects) {
+            return asArray(projectService.listProjects());
+        }
+    } catch (serviceError) {
+        System.warn("Unable to list projects with the infrastructure project service: " + serviceError);
+    }
+
+    return projects;
+}
+
+function resolveProject(host, name) {
+    var projects = findProjects(host);
+    var matches = new Array();
+    var target = normalize(name);
+
+    for (var i = 0; i &lt; projects.length; i++) {
+        var candidateName = getField(projects[i], "name");
+        if (normalize(candidateName) === target) {
+            matches.push(projects[i]);
+        }
+    }
+
+    if (matches.length === 0) {
+        throw "Project not found: " + name;
+    }
+    if (matches.length &gt; 1) {
+        throw "Multiple projects matched name: " + name;
+    }
+    return matches[0];
+}
+
+function getMachines(host) {
+    try {
+        if (typeof VraEntitiesFinder !== "undefined" &amp;&amp; VraEntitiesFinder.getMachines) {
+            return asArray(VraEntitiesFinder.getMachines(host));
+        }
+    } catch (finderError) {
+        System.warn("Unable to list machines with VraEntitiesFinder.getMachines: " + finderError);
+    }
+
+    return asArray(System.getModule("com.vmware.library.vra.infrastructure.machine").getAllMachines(host));
+}
+
+function getDeployments(host) {
+    try {
+        if (typeof VraEntitiesFinder !== "undefined" &amp;&amp; VraEntitiesFinder.getDeployments) {
+            return asArray(VraEntitiesFinder.getDeployments(host));
+        }
+    } catch (finderError) {
+        System.warn("Unable to list deployments with VraEntitiesFinder.getDeployments: " + finderError);
+    }
+
+    try {
+        if (host.createDeploymentClient) {
+            var deploymentClient = host.createDeploymentClient();
+            if (deploymentClient.getDeployments) {
+                return asArray(deploymentClient.getDeployments());
+            }
+            if (deploymentClient.listDeployments) {
+                return asArray(deploymentClient.listDeployments());
+            }
+        }
+    } catch (clientError) {
+        System.warn("Unable to list deployments with the deployment client: " + clientError);
+    }
+
+    return new Array();
+}
+
+function getMachineProjectId(machine) {
+    var projectId = getField(machine, "projectId");
+    if (projectId) {
+        return projectId;
+    }
+    var project = getField(machine, "project");
+    return getField(project, "id");
+}
+
+function getMachineProjectName(machine) {
+    var projectName = getField(machine, "projectName");
+    if (projectName) {
+        return projectName;
+    }
+    var project = getField(machine, "project");
+    return getField(project, "name");
+}
+
+function getDeploymentProjectId(deployment) {
+    var projectId = getField(deployment, "projectId");
+    if (projectId) {
+        return projectId;
+    }
+    var project = getField(deployment, "project");
+    return getField(project, "id");
+}
+
+function addProperty(properties, name, value) {
+    properties.put(name, toText(value));
+}
+
+function machineMatchesProject(machine, projectId, projectName) {
+    var machineProjectId = toText(getMachineProjectId(machine));
+    var machineProjectName = toText(getMachineProjectName(machine));
+    return machineProjectId === projectId || normalize(machineProjectName) === normalize(projectName);
+}
+
+function deploymentMatchesProject(deployment, projectId, projectName) {
+    var deploymentProjectId = toText(getDeploymentProjectId(deployment));
+    var deploymentProjectName = toText(getField(deployment, "projectName"));
+    return deploymentProjectId === projectId || normalize(deploymentProjectName) === normalize(projectName);
+}
+
+function getMachineDeploymentId(machine) {
+    return toText(getField(machine, "deploymentId") || getField(machine, "deployment"));
+}
+
+function getDeploymentId(deployment) {
+    return toText(getField(deployment, "id"));
+}
+
+function getDeploymentName(deployment) {
+    return toText(getField(deployment, "name"));
+}
+
+function buildVmRecord(machine, deployment, projectId, projectName) {
+    var deploymentId = deployment ? getDeploymentId(deployment) : getMachineDeploymentId(machine);
+    var deploymentName = deployment ? getDeploymentName(deployment) : getField(machine, "deploymentName");
+    var vm = new Properties();
+
+    addProperty(vm, "id", getField(machine, "id") || deploymentId);
+    addProperty(vm, "name", deploymentName || getField(machine, "name"));
+    addProperty(vm, "status", getField(machine, "status") || getField(deployment, "status"));
+    addProperty(vm, "powerState", getField(machine, "powerState"));
+    addProperty(vm, "projectId", toText(getMachineProjectId(machine)) || toText(getDeploymentProjectId(deployment)) || projectId);
+    addProperty(vm, "projectName", toText(getMachineProjectName(machine)) || toText(getField(deployment, "projectName")) || projectName);
+    addProperty(vm, "deploymentId", deploymentId);
+    addProperty(vm, "deploymentName", deploymentName);
+    addProperty(vm, "owner", getField(machine, "owner") || getField(deployment, "ownedBy") || getField(deployment, "createdBy"));
+    addProperty(vm, "address", getField(machine, "address"));
+
+    return vm;
+}
+
+var host = selectHost();
+System.log("Selected VRA host: " + toText(getField(host, "name")) + " (" + toText(getField(host, "id")) + ")");
+
+var project = resolveProject(host, requestedProjectName);
+var projectId = toText(getField(project, "id"));
+var resolvedProjectName = toText(getField(project, "name"));
+System.log("Resolved project: " + resolvedProjectName + " (" + projectId + ")");
+
+var machines = getMachines(host);
+var matchingMachines = new Array();
+var machinesByDeploymentId = {};
+var usedMachineIndexes = {};
+
+for (var j = 0; j &lt; machines.length; j++) {
+    var machine = machines[j];
+    if (!machineMatchesProject(machine, projectId, resolvedProjectName)) {
+        continue;
+    }
+    matchingMachines.push(machine);
+    var machineDeploymentId = getMachineDeploymentId(machine);
+    if (machineDeploymentId &amp;&amp; !machinesByDeploymentId[machineDeploymentId]) {
+        machinesByDeploymentId[machineDeploymentId] = machine;
+    }
+}
+
+var deployments = getDeployments(host);
+for (var d = 0; d &lt; deployments.length; d++) {
+    var deployment = deployments[d];
+    if (!deploymentMatchesProject(deployment, projectId, resolvedProjectName)) {
+        continue;
+    }
+
+    var deploymentId = getDeploymentId(deployment);
+    var deploymentMachine = machinesByDeploymentId[deploymentId];
+    if (deploymentMachine) {
+        usedMachineIndexes[toText(getField(deploymentMachine, "id"))] = true;
+    }
+    vms.push(buildVmRecord(deploymentMachine, deployment, projectId, resolvedProjectName));
+}
+
+if (vms.length === 0) {
+    for (var m = 0; m &lt; matchingMachines.length; m++) {
+        vms.push(buildVmRecord(matchingMachines[m], null, projectId, resolvedProjectName));
+    }
+} else {
+    for (var n = 0; n &lt; matchingMachines.length; n++) {
+        var machineId = toText(getField(matchingMachines[n], "id"));
+        if (!usedMachineIndexes[machineId]) {
+            vms.push(buildVmRecord(matchingMachines[n], null, projectId, resolvedProjectName));
+        }
+    }
+}
+
+vmCount = vms.length;
+System.log("Found " + vmCount + " VM/deployment record(s) for project " + resolvedProjectName + " (" + projectId + ")");</script>
+        <in-binding>
+            <bind name="projectName" type="string" export-name="projectName"/>
+        </in-binding>
+        <out-binding>
+            <bind name="vms" type="Array/Properties" export-name="vms"/>
+            <bind name="vmCount" type="number" export-name="vmCount"/>
+        </out-binding>
+        <description>Find machines by VCFA/VRA project name.</description>
+        <position y="50.0" x="180.0"/>
+    </workflow-item>
+    <presentation/>
+</ns2:workflow>
