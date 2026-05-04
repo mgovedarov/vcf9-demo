@@ -18,11 +18,13 @@
     </output>
     <workflow-item name="item0" type="end" end-mode="0" comparator="0">
         <in-binding/>
+        <out-binding/>
         <position y="50.0" x="360.0"/>
     </workflow-item>
     <workflow-item name="item1" out-name="item0" throw-bind-name="" type="task" comparator="0">
         <display-name>List VMs</display-name>
-        <script encoded="false">var requestedProjectName = projectName ? String(projectName).replace(/^\s+|\s+$/g, "") : "";
+        <script encoded="false">System.log("start...");
+var requestedProjectName = projectName ? String(projectName).replace(/^\s+|\s+$/g, "") : "";
 if (!requestedProjectName) {
     throw "projectName is required.";
 }
@@ -329,5 +331,4 @@ System.log("Found " + vmCount + " VM/deployment record(s) for project " + resolv
         <description>Find machines by VCFA/VRA project name.</description>
         <position y="50.0" x="180.0"/>
     </workflow-item>
-    <presentation/>
 </ns2:workflow>
