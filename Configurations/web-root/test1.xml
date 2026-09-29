@@ -1,0 +1,9 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<config-element id="ca3e2649-6df2-4a4e-a84b-de99aab314f6" version="0.0.0">
+  <display-name><![CDATA[test1]]></display-name>
+  <atts>
+    <att name="var_0" type="string" read-only="false">
+      <value encoded="n"><![CDATA[]]></value>
+    </att>
+  </atts>
+</config-element>
