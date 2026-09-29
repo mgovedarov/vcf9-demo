@@ -1,5 +1,5 @@
 <?xml version='1.0' encoding='UTF-8'?>
-<dunes-script-module name="RestClient" result-type="Any" api-version="6.0.0" id="5b66b95e-3c08-4628-8baa-5e812d0a748d" version="1.0.0" allowed-operations="vf" category-name="com.evoila.rest">
+<dunes-script-module name="RestClient" result-type="Any" api-version="6.0.0" id="5b66b95e-3c08-4628-8baa-5e812d0a748d" version="1.1.0" allowed-operations="vf" category-name="com.evoila.rest">
   <description><![CDATA[Returns the RestClient constructor, a generic client for REST endpoints built on the vRO REST plugin.
 
 Usage (create and use the client inside ONE scriptable task or action):
@@ -13,8 +13,13 @@ Usage (create and use the client inside ONE scriptable task or action):
                                RestClient.pagers.pageNumber({ itemsField: "content", pageSize: 100 }));
 
 Options: host | baseUrl (exactly one), auth, defaultHeaders, throwOnError (default true),
-retry {maxAttempts, baseDelayMs, maxDelayMs, retryNonIdempotent}, connectionTimeoutSec, operationTimeoutSec,
-hostVerification (URL mode only, default true), debug.
+retry {maxAttempts, baseDelayMs, maxDelayMs, retryNonIdempotent}, debug.
+URL mode only: connectionTimeoutSec, operationTimeoutSec, hostVerification (default true),
+trustCert (default false; imports the server CA into the Orchestrator keystore, a write to the keystore).
+
+Auth: "bearer" adds an Authorization header per request (both modes). "basic" is set on the transient host
+(URL mode only; a REST:RESTHost keeps its own authentication). "none" uses whatever the host has configured.
+Per-call option pathEncoded: true skips encoding of the path (absolute next-page URLs are never re-encoded).
 
 Methods: request, get, post, put, patch, del, getJson, postJson, putJson, patchJson, deleteJson, getAllPages.
 request() returns {statusCode, headers (lower-case keys), body, ok, json()}.
@@ -24,9 +29,10 @@ A non-2xx response throws an Error with statusCode and responseBody properties u
 Do NOT store the client in a workflow attribute or pass it between workflow items: the serialized object loses its methods.
 Pass the host/URL and credentials instead. Headers, tokens and passwords are never logged.
 
-NOTE: the REST plugin calls used here (RESTHostManager.createHost/createTransientHostFrom, RESTHost.url/connectionTimeout/operationTimeout/hostVerification,
-createRequest, setHeader, contentType, execute, statusCode, contentAsString, getAllHeaders) and CryptoEncoding.base64Encode
-have not been verified against the target Orchestrator yet.]]></description>
+NOTE: the REST plugin calls follow the usage in the maintained pscoe tswl.http library (createHostSupportingParallelRequests,
+createTransientHostFrom, reloadConfiguration, RESTAuthenticationManager.createAuthentication, createRequest, setHeader,
+execute, statusCode, contentAsString, getAllHeaders, and the url/name/hostVerification/timeout host properties).
+They have not been run on a live Orchestrator yet.]]></description>
   <script encoded="false"><![CDATA[function isString(v) {
 	return typeof v === "string" || v instanceof String;
 }
@@ -149,20 +155,47 @@ function RestClient(options) {
 	this.retry = copyInto({ maxAttempts: 3, baseDelayMs: 1000, maxDelayMs: 30000, retryNonIdempotent: false }, options.retry);
 
 	if (options.host) {
+		if (this.auth.type === "basic") {
+			throw new Error("RestClient: basic auth is configured on the transient host, so it needs 'baseUrl'. A REST:RESTHost keeps its own authentication.");
+		}
 		this.host = options.host;
 	} else {
-		var template = RESTHostManager.createHost("RestClient-transient");
-		template.url = trimSlashes(options.baseUrl, false, true);
-		if (hasValue(options.connectionTimeoutSec)) {
-			template.connectionTimeout = options.connectionTimeoutSec;
-		}
-		if (hasValue(options.operationTimeoutSec)) {
-			template.operationTimeout = options.operationTimeoutSec;
-		}
-		template.hostVerification = options.hostVerification !== false;
-		this.host = RESTHostManager.createTransientHostFrom(template);
+		this.host = this._createTransientHost(options);
 	}
 }
+
+RestClient.prototype._createTransientHost = function(options) {
+	var url = trimSlashes(options.baseUrl, false, true);
+	var name = url.replace(/^https?:\/\//i, "").replace(/\W/g, "_");
+	var host = RESTHostManager.createHostSupportingParallelRequests(name);
+	host.name = name;
+	host.url = url;
+	host.hostVerification = options.hostVerification !== false;
+	if (hasValue(options.connectionTimeoutSec)) {
+		host.connectionTimeout = options.connectionTimeoutSec;
+	}
+	if (hasValue(options.operationTimeoutSec)) {
+		host.operationTimeout = options.operationTimeoutSec;
+	}
+	if (this.auth.type === "basic") {
+		host.authentication = RESTAuthenticationManager.createAuthentication("Basic",
+			["Shared Session", String(this.auth.username), String(this.auth.password)]);
+	}
+	host = RESTHostManager.createTransientHostFrom(host);
+	RESTHostManager.reloadConfiguration();
+	if (options.trustCert === true && /^https:/i.test(url)) {
+		this._importCertificate(url);
+	}
+	return host;
+};
+
+// Writes the server's CA to the Orchestrator keystore, so it is opt-in (trustCert: true).
+RestClient.prototype._importCertificate = function(url) {
+	var importAction = eval("Config.getKeystores().getImportCAFromUrlAction()");
+	importAction.getModel().value = url;
+	importAction.execute();
+	System.log("[RestClient] Imported certificate for " + url + " into the Orchestrator keystore.");
+};
 
 RestClient.prototype._log = function(message) {
 	if (this.debug) {
@@ -172,23 +205,23 @@ RestClient.prototype._log = function(message) {
 
 RestClient.prototype._buildHeaders = function(opts) {
 	var headers = copyInto(copyInto({}, this.defaultHeaders), opts.headers);
-	if (this.auth.type === "basic") {
-		if (typeof CryptoEncoding === "undefined") {
-			throw new Error("RestClient: CryptoEncoding is not available for Basic auth on this Orchestrator.");
-		}
-		headers["Authorization"] = "Basic " + CryptoEncoding.base64Encode(String(this.auth.username) + ":" + String(this.auth.password));
-	} else if (this.auth.type === "bearer") {
+	if (this.auth.type === "bearer") {
 		headers["Authorization"] = "Bearer " + String(this.auth.token);
 	}
 	return headers;
 };
 
-RestClient.prototype._buildPath = function(path, query) {
+RestClient.prototype._buildPath = function(path, query, pathEncoded) {
 	var p = hasValue(path) ? String(path) : "";
 	if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(p)) {
+		// Absolute URLs come from the server (e.g. next links) and are already encoded.
 		p = this._relativize(p);
+		pathEncoded = true;
 	}
 	p = "/" + trimSlashes(p, true, false);
+	if (pathEncoded !== true) {
+		p = encodeURI(p);
+	}
 	var qs = query ? encodeQuery(query) : "";
 	if (qs) {
 		p += (p.indexOf("?") === -1 ? "?" : "&") + qs;
@@ -238,7 +271,7 @@ RestClient.prototype._retryDelayMs = function(attempt, response) {
 RestClient.prototype.request = function(method, path, opts) {
 	opts = opts || {};
 	method = String(method).toUpperCase();
-	var fullPath = this._buildPath(path, opts.query);
+	var fullPath = this._buildPath(path, opts.query, opts.pathEncoded);
 	var headers = this._buildHeaders(opts);
 	var throwOnError = opts.throwOnError !== undefined ? opts.throwOnError : this.throwOnError;
 	var canRetry = IDEMPOTENT[method] === true || this.retry.retryNonIdempotent === true;
