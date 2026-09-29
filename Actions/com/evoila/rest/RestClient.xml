@@ -1,0 +1,430 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<dunes-script-module name="RestClient" result-type="Any" api-version="6.0.0" id="5b66b95e-3c08-4628-8baa-5e812d0a748d" version="1.0.0" allowed-operations="vf" category-name="com.evoila.rest">
+  <description><![CDATA[Returns the RestClient constructor, a generic client for REST endpoints built on the vRO REST plugin.
+
+Usage (create and use the client inside ONE scriptable task or action):
+  var RestClient = System.getModule("com.evoila.rest").RestClient();
+  var client = new RestClient({
+    baseUrl: "https://api.example.local",          // or host: <REST:RESTHost>
+    auth: { type: "bearer", token: token }         // or { type: "basic", username: u, password: p }
+  });
+  var item = client.getJson("/v1/things/42");
+  var all = client.getAllPages("/v1/things", { query: { state: "ok" } },
+                               RestClient.pagers.pageNumber({ itemsField: "content", pageSize: 100 }));
+
+Options: host | baseUrl (exactly one), auth, defaultHeaders, throwOnError (default true),
+retry {maxAttempts, baseDelayMs, maxDelayMs, retryNonIdempotent}, connectionTimeoutSec, operationTimeoutSec,
+hostVerification (URL mode only, default true), debug.
+
+Methods: request, get, post, put, patch, del, getJson, postJson, putJson, patchJson, deleteJson, getAllPages.
+request() returns {statusCode, headers (lower-case keys), body, ok, json()}.
+A non-2xx response throws an Error with statusCode and responseBody properties unless throwOnError is false.
+429 and 5xx (and connection errors) are retried; POST/PATCH only when retry.retryNonIdempotent is true.
+
+Do NOT store the client in a workflow attribute or pass it between workflow items: the serialized object loses its methods.
+Pass the host/URL and credentials instead. Headers, tokens and passwords are never logged.
+
+NOTE: the REST plugin calls used here (RESTHostManager.createHost/createTransientHostFrom, RESTHost.url/connectionTimeout/operationTimeout/hostVerification,
+createRequest, setHeader, contentType, execute, statusCode, contentAsString, getAllHeaders) and CryptoEncoding.base64Encode
+have not been verified against the target Orchestrator yet.]]></description>
+  <script encoded="false"><![CDATA[function isString(v) {
+	return typeof v === "string" || v instanceof String;
+}
+
+function hasValue(v) {
+	return v !== null && v !== undefined && v !== "";
+}
+
+function trimSlashes(text, leading, trailing) {
+	var s = String(text);
+	if (leading) {
+		s = s.replace(/^\/+/, "");
+	}
+	if (trailing) {
+		s = s.replace(/\/+$/, "");
+	}
+	return s;
+}
+
+function getByPath(obj, path) {
+	if (!hasValue(path)) {
+		return obj;
+	}
+	var parts = String(path).split(".");
+	var cur = obj;
+	for (var i = 0; i < parts.length; i++) {
+		if (cur === null || cur === undefined) {
+			return null;
+		}
+		cur = cur[parts[i]];
+	}
+	return cur === undefined ? null : cur;
+}
+
+function copyInto(target, source) {
+	if (source) {
+		for (var k in source) {
+			if (source.hasOwnProperty(k)) {
+				target[k] = source[k];
+			}
+		}
+	}
+	return target;
+}
+
+function hasHeader(headers, name) {
+	var lower = name.toLowerCase();
+	for (var k in headers) {
+		if (headers.hasOwnProperty(k) && k.toLowerCase() === lower) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function encodeQuery(query) {
+	var pairs = [];
+	for (var k in query) {
+		if (!query.hasOwnProperty(k) || !hasValue(query[k])) {
+			continue;
+		}
+		var values = (query[k] instanceof Array) ? query[k] : [query[k]];
+		for (var i = 0; i < values.length; i++) {
+			pairs.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(values[i])));
+		}
+	}
+	return pairs.join("&");
+}
+
+function excerpt(text, max) {
+	var s = hasValue(text) ? String(text) : "";
+	return s.length > max ? s.substring(0, max) + "...(truncated)" : s;
+}
+
+function headersToObject(rawHeaders) {
+	var result = {};
+	if (!rawHeaders) {
+		return result;
+	}
+	var keys = rawHeaders.keys ? rawHeaders.keys : null;
+	if (keys) {
+		for (var i = 0; i < keys.length; i++) {
+			result[String(keys[i]).toLowerCase()] = String(rawHeaders.get(keys[i]));
+		}
+	} else {
+		for (var k in rawHeaders) {
+			if (typeof rawHeaders[k] !== "function") {
+				result[String(k).toLowerCase()] = String(rawHeaders[k]);
+			}
+		}
+	}
+	return result;
+}
+
+var IDEMPOTENT = { GET: true, HEAD: true, PUT: true, DELETE: true, OPTIONS: true };
+
+function RestClient(options) {
+	options = options || {};
+	if (!!options.host === !!options.baseUrl) {
+		throw new Error("RestClient: provide exactly one of 'host' (REST:RESTHost) or 'baseUrl'.");
+	}
+
+	this.auth = options.auth || { type: "none" };
+	this.auth.type = String(this.auth.type || "none").toLowerCase();
+	if (this.auth.type === "basic") {
+		if (!hasValue(this.auth.username) || !hasValue(this.auth.password)) {
+			throw new Error("RestClient: basic auth requires username and password.");
+		}
+	} else if (this.auth.type === "bearer") {
+		if (!hasValue(this.auth.token)) {
+			throw new Error("RestClient: bearer auth requires token.");
+		}
+	} else if (this.auth.type !== "none") {
+		throw new Error("RestClient: unsupported auth type '" + this.auth.type + "' (use none, basic or bearer).");
+	}
+
+	this.defaultHeaders = copyInto({}, options.defaultHeaders);
+	this.throwOnError = options.throwOnError !== false;
+	this.debug = options.debug === true;
+	this.retry = copyInto({ maxAttempts: 3, baseDelayMs: 1000, maxDelayMs: 30000, retryNonIdempotent: false }, options.retry);
+
+	if (options.host) {
+		this.host = options.host;
+	} else {
+		var template = RESTHostManager.createHost("RestClient-transient");
+		template.url = trimSlashes(options.baseUrl, false, true);
+		if (hasValue(options.connectionTimeoutSec)) {
+			template.connectionTimeout = options.connectionTimeoutSec;
+		}
+		if (hasValue(options.operationTimeoutSec)) {
+			template.operationTimeout = options.operationTimeoutSec;
+		}
+		template.hostVerification = options.hostVerification !== false;
+		this.host = RESTHostManager.createTransientHostFrom(template);
+	}
+}
+
+RestClient.prototype._log = function(message) {
+	if (this.debug) {
+		System.log("[RestClient] " + message);
+	}
+};
+
+RestClient.prototype._buildHeaders = function(opts) {
+	var headers = copyInto(copyInto({}, this.defaultHeaders), opts.headers);
+	if (this.auth.type === "basic") {
+		if (typeof CryptoEncoding === "undefined") {
+			throw new Error("RestClient: CryptoEncoding is not available for Basic auth on this Orchestrator.");
+		}
+		headers["Authorization"] = "Basic " + CryptoEncoding.base64Encode(String(this.auth.username) + ":" + String(this.auth.password));
+	} else if (this.auth.type === "bearer") {
+		headers["Authorization"] = "Bearer " + String(this.auth.token);
+	}
+	return headers;
+};
+
+RestClient.prototype._buildPath = function(path, query) {
+	var p = hasValue(path) ? String(path) : "";
+	if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(p)) {
+		p = this._relativize(p);
+	}
+	p = "/" + trimSlashes(p, true, false);
+	var qs = query ? encodeQuery(query) : "";
+	if (qs) {
+		p += (p.indexOf("?") === -1 ? "?" : "&") + qs;
+	}
+	return p;
+};
+
+RestClient.prototype._relativize = function(url) {
+	var base = trimSlashes(this.host.url, false, true);
+	if (url.indexOf(base) !== 0) {
+		throw new Error("RestClient: URL '" + excerpt(url, 200) + "' does not belong to the configured host.");
+	}
+	return url.substring(base.length);
+};
+
+RestClient.prototype._send = function(method, path, headers, opts) {
+	var body = hasValue(opts.body) ? String(opts.body) : null;
+	var request = this.host.createRequest(method, path, body);
+	for (var name in headers) {
+		if (headers.hasOwnProperty(name)) {
+			request.setHeader(name, String(headers[name]));
+		}
+	}
+	if (hasValue(opts.contentType)) {
+		request.contentType = opts.contentType;
+	}
+	var response = request.execute();
+	var text = response.contentAsString;
+	return {
+		statusCode: Number(response.statusCode),
+		headers: headersToObject(response.getAllHeaders()),
+		body: hasValue(text) ? String(text) : ""
+	};
+};
+
+RestClient.prototype._retryDelayMs = function(attempt, response) {
+	var delay = this.retry.baseDelayMs * Math.pow(2, attempt - 1);
+	if (response && response.headers["retry-after"]) {
+		var seconds = parseInt(response.headers["retry-after"], 10);
+		if (!isNaN(seconds) && seconds >= 0) {
+			delay = seconds * 1000;
+		}
+	}
+	return Math.min(delay, this.retry.maxDelayMs);
+};
+
+RestClient.prototype.request = function(method, path, opts) {
+	opts = opts || {};
+	method = String(method).toUpperCase();
+	var fullPath = this._buildPath(path, opts.query);
+	var headers = this._buildHeaders(opts);
+	var throwOnError = opts.throwOnError !== undefined ? opts.throwOnError : this.throwOnError;
+	var canRetry = IDEMPOTENT[method] === true || this.retry.retryNonIdempotent === true;
+	var logPath = fullPath.split("?")[0];
+
+	var attempt = 0;
+	var response = null;
+	while (true) {
+		attempt++;
+		response = null;
+		var failure = null;
+		try {
+			response = this._send(method, fullPath, headers, opts);
+		} catch (e) {
+			failure = e;
+		}
+
+		var transient = failure !== null || response.statusCode === 429 || response.statusCode >= 500;
+		if (!transient || !canRetry || attempt >= this.retry.maxAttempts) {
+			if (failure !== null) {
+				var err = new Error("REST " + method + " " + logPath + " failed after " + attempt + " attempt(s): " + failure);
+				err.cause = failure;
+				throw err;
+			}
+			break;
+		}
+		var wait = this._retryDelayMs(attempt, response);
+		System.warn("[RestClient] " + method + " " + logPath + " attempt " + attempt + "/" + this.retry.maxAttempts +
+			" got " + (failure !== null ? "a connection error" : "HTTP " + response.statusCode) + "; retrying in " + wait + " ms");
+		System.sleep(wait);
+	}
+
+	this._log(method + " " + logPath + " -> HTTP " + response.statusCode);
+	response.ok = response.statusCode >= 200 && response.statusCode < 300;
+	response.json = function() {
+		if (!hasValue(response.body) || response.statusCode === 204) {
+			return null;
+		}
+		try {
+			return JSON.parse(response.body);
+		} catch (e) {
+			throw new Error("REST " + method + " " + logPath + ": response is not valid JSON: " + excerpt(response.body, 200));
+		}
+	};
+
+	if (!response.ok && throwOnError) {
+		var error = new Error("REST " + method + " " + logPath + " failed: HTTP " + response.statusCode + " - " + excerpt(response.body, 500));
+		error.statusCode = response.statusCode;
+		error.responseBody = response.body;
+		throw error;
+	}
+	return response;
+};
+
+RestClient.prototype.get = function(path, opts) {
+	return this.request("GET", path, opts);
+};
+RestClient.prototype.post = function(path, body, opts) {
+	return this.request("POST", path, copyInto({ body: body }, opts));
+};
+RestClient.prototype.put = function(path, body, opts) {
+	return this.request("PUT", path, copyInto({ body: body }, opts));
+};
+RestClient.prototype.patch = function(path, body, opts) {
+	return this.request("PATCH", path, copyInto({ body: body }, opts));
+};
+RestClient.prototype.del = function(path, opts) {
+	return this.request("DELETE", path, opts);
+};
+
+RestClient.prototype._jsonRequest = function(method, path, body, opts) {
+	var o = copyInto({}, opts);
+	o.headers = copyInto({}, o.headers);
+	if (!hasHeader(o.headers, "Accept")) {
+		o.headers["Accept"] = "application/json";
+	}
+	if (body !== undefined && body !== null) {
+		o.body = isString(body) ? String(body) : JSON.stringify(body);
+		if (!hasValue(o.contentType) && !hasHeader(o.headers, "Content-Type")) {
+			o.contentType = "application/json";
+		}
+	}
+	return this.request(method, path, o).json();
+};
+
+RestClient.prototype.getJson = function(path, opts) {
+	return this._jsonRequest("GET", path, null, opts);
+};
+RestClient.prototype.postJson = function(path, body, opts) {
+	return this._jsonRequest("POST", path, body, opts);
+};
+RestClient.prototype.putJson = function(path, body, opts) {
+	return this._jsonRequest("PUT", path, body, opts);
+};
+RestClient.prototype.patchJson = function(path, body, opts) {
+	return this._jsonRequest("PATCH", path, body, opts);
+};
+RestClient.prototype.deleteJson = function(path, opts) {
+	return this._jsonRequest("DELETE", path, null, opts);
+};
+
+/**
+ * pager = {
+ *   extractItems: function(json, response) -> Array,
+ *   nextRequest:  function(json, response, pageIndex) -> {path, query} | null,
+ *   firstQuery:   optional query merged into the first request,
+ *   maxPages:     optional guard, default 100
+ * }
+ * nextRequest: "query" is merged over opts.query; query === null drops opts.query (for absolute next links).
+ */
+RestClient.prototype.getAllPages = function(path, opts, pager) {
+	if (!pager || typeof pager.extractItems !== "function" || typeof pager.nextRequest !== "function") {
+		throw new Error("RestClient.getAllPages: pager needs extractItems and nextRequest functions.");
+	}
+	var maxPages = pager.maxPages || 100;
+	var items = [];
+	var currentPath = path;
+	var currentOpts = copyInto({}, opts);
+	currentOpts.query = copyInto(copyInto({}, currentOpts.query), pager.firstQuery);
+
+	for (var page = 0; page < maxPages; page++) {
+		var response = this.request("GET", currentPath, copyInto({ headers: { Accept: "application/json" } }, currentOpts));
+		var json = response.json();
+		var pageItems = pager.extractItems(json, response) || [];
+		for (var i = 0; i < pageItems.length; i++) {
+			items.push(pageItems[i]);
+		}
+		var next = pager.nextRequest(json, response, page);
+		if (!next) {
+			return items;
+		}
+		if (next.path) {
+			currentPath = next.path;
+		}
+		currentOpts = copyInto({}, currentOpts);
+		currentOpts.query = next.query === null ? null : copyInto(copyInto({}, currentOpts.query), next.query);
+	}
+	throw new Error("RestClient.getAllPages: exceeded maxPages (" + maxPages + ") for " + String(path).split("?")[0]);
+};
+
+RestClient.pagers = {
+	/** options: itemsField (dot path, omit if body is an array), pageParam ("page"), sizeParam ("size"), pageSize (100), firstPage (0), maxPages */
+	pageNumber: function(options) {
+		options = options || {};
+		var pageParam = options.pageParam || "page";
+		var sizeParam = options.sizeParam || "size";
+		var pageSize = options.pageSize || 100;
+		var firstPage = hasValue(options.firstPage) ? options.firstPage : 0;
+		var first = {};
+		first[pageParam] = firstPage;
+		first[sizeParam] = pageSize;
+		var extract = function(json) {
+			var found = getByPath(json, options.itemsField);
+			return found instanceof Array ? found : [];
+		};
+		return {
+			firstQuery: first,
+			maxPages: options.maxPages,
+			extractItems: extract,
+			nextRequest: function(json, response, pageIndex) {
+				if (extract(json).length < pageSize) {
+					return null;
+				}
+				var q = {};
+				q[pageParam] = firstPage + pageIndex + 1;
+				return { query: q };
+			}
+		};
+	},
+	/** options: itemsField (dot path, omit if body is an array), nextField (dot path of the next-page URL or path, default "next"), maxPages */
+	nextLink: function(options) {
+		options = options || {};
+		var nextField = options.nextField || "next";
+		return {
+			maxPages: options.maxPages,
+			extractItems: function(json) {
+				var found = getByPath(json, options.itemsField);
+				return found instanceof Array ? found : [];
+			},
+			nextRequest: function(json) {
+				var link = getByPath(json, nextField);
+				return hasValue(link) ? { path: String(link), query: null } : null;
+			}
+		};
+	}
+};
+
+return RestClient;]]></script>
+</dunes-script-module>
