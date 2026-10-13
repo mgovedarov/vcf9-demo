@@ -1,0 +1,56 @@
+# Plain Kubernetes manifest derived from the VCF Automation blueprint
+# "basic-photon-vm" (photon.yaml). Applies directly with kubectl against the
+# Supervisor namespace test-ns-ztk39 (the blueprint marks it existing: true,
+# so it is referenced here, not created).
+#
+# Inputs (blueprint "inputs" block) become envsubst placeholders:
+#   ${VM_HOSTNAME}  guest hostname, pattern ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$
+#   ${VM_IP}        IPv4 from subnet-1 172.30.0.32/28, usable 172.30.0.34 - 172.30.0.46
+#
+# Render and apply. Pass the variable list to envsubst: the password hash in
+# runcmd contains '$' sequences that unrestricted envsubst would blank out.
+#
+#   VM_HOSTNAME=photon01 VM_IP=172.30.0.34 \
+#     envsubst '${VM_HOSTNAME} ${VM_IP}' < basic-photon-vm.k8s.yaml | kubectl apply -f -
+#
+# PowerShell 7 (no envsubst, no '<' redirection; single quotes keep the
+# placeholders literal, and String.Replace is a plain text replace):
+#
+#   $VM_HOSTNAME = 'photon01'; $VM_IP = '172.30.0.34'
+#   (Get-Content -Raw basic-photon-vm.k8s.yaml).Replace('${VM_HOSTNAME}', $VM_HOSTNAME).Replace('${VM_IP}', $VM_IP) | kubectl apply -f -
+#
+# Equivalent of the blueprint's wait.conditions block:
+#
+#   kubectl -n test-ns-ztk39 wait vm/photon01 --for=condition=VirtualMachineCreated --timeout=10m
+#
+apiVersion: vmoperator.vmware.com/v1alpha5
+kind: VirtualMachine
+metadata:
+  name: ${VM_HOSTNAME}
+  namespace: test-ns-ztk39
+spec:
+  className: best-effort-xsmall
+  imageName: photon-hw15-5.0-dde71ec57.x86_64
+  storageClass: nfs
+  powerState: PoweredOn
+  bootstrap:
+    cloudInit:
+      cloudConfig:
+        runcmd:
+          # root password = "root" (SHA-512 hash, set directly to bypass PAM password-quality checks)
+          - usermod -p '$6$vcfa9lab$PC1LBOA5MxILs0Al.ubDgVrOBLFv/sK1nGh3qrmVvip.hB5O.3WOoHBJ3PLRoF8djR6hkaM7MAHN5Qgdx.FFE1' root
+          - chage -I -1 -m 0 -M 99999 -E -1 root
+          - sed -i -E 's/^#?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          - sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          - systemctl restart sshd
+  network:
+    hostName: ${VM_HOSTNAME}
+    interfaces:
+      - name: eth0
+        network:
+          apiVersion: crd.nsx.vmware.com/v1alpha1
+          kind: Subnet
+          name: subnet-1
+        addresses:
+          - ${VM_IP}/28
+        gateway4: 172.30.0.33

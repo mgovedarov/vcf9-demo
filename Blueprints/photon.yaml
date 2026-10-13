@@ -1,0 +1,60 @@
+name: basic-alpine-vm
+formatVersion: 2
+inputs:
+  hostname:
+    type: string
+    title: Hostname
+    description: Guest hostname (naming standard applies)
+    pattern: ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$
+  ipAddress:
+    type: string
+    title: Static IP address
+    description: IPv4 address from subnet-1 (172.30.0.32/28), usable range 172.30.0.34 - 172.30.0.46
+    pattern: ^172\.30\.0\.(3[4-9]|4[0-6])$
+resources:
+  ns:
+    type: CCI.Supervisor.Namespace
+    properties:
+      name: test-ns-ztk39
+      existing: true
+  alpine-vm:
+    type: CCI.Supervisor.Resource
+    properties:
+      context: ${resource.ns.id}
+      manifest:
+        apiVersion: vmoperator.vmware.com/v1alpha5
+        kind: VirtualMachine
+        metadata:
+          name: ${input.hostname}
+          labels:
+            testCP: test123
+        spec:
+          className: best-effort-xsmall
+          imageName: photon-hw15-5.0-dde71ec57.x86_64
+          storageClass: nfs
+          powerState: PoweredOn
+          bootstrap:
+            cloudInit:
+              cloudConfig:
+                runcmd:
+                  # root password = "root" (SHA-512 hash, set directly to bypass PAM password-quality checks)
+                  - usermod -p '$6$vcfa9lab$PC1LBOA5MxILs0Al.ubDgVrOBLFv/sK1nGh3qrmVvip.hB5O.3WOoHBJ3PLRoF8djR6hkaM7MAHN5Qgdx.FFE1' root
+                  - chage -I -1 -m 0 -M 99999 -E -1 root
+                  - sed -i -E 's/^#?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+                  - sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+                  - systemctl restart sshd
+          network:
+            hostName: ${input.hostname}
+            interfaces:
+              - name: eth0
+                network:
+                  apiVersion: crd.nsx.vmware.com/v1alpha1
+                  kind: Subnet
+                  name: subnet-1
+                addresses:
+                  - ${input.ipAddress + '/28'}
+                gateway4: 172.30.0.33
+      wait:
+        conditions:
+          - type: VirtualMachineCreated
+            status: 'True'

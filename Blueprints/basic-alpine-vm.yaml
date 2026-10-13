@@ -1,0 +1,36 @@
+name: basic-alpine-vm
+formatVersion: 2
+inputs:
+  hostname:
+    type: string
+    title: Hostname
+    description: Guest hostname (naming standard applies)
+    pattern: ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$
+resources:
+  ns:
+    type: CCI.Supervisor.Namespace
+    properties:
+      name: amer-ns1-nl254
+      existing: true
+  alpine-vm:
+    type: CCI.Supervisor.Resource
+    properties:
+      context: ${resource.ns.id}
+      manifest:
+        apiVersion: vmoperator.vmware.com/v1alpha5
+        kind: VirtualMachine
+        metadata:
+          name: ${input.hostname}
+          labels:
+            testCP: test123
+        spec:
+          className: best-effort-xsmall
+          imageName: vmi-2298f86b720612f67
+          storageClass: vks
+          powerState: PoweredOn
+          network:
+            hostName: ${input.hostname}
+      wait:
+        conditions:
+          - type: VirtualMachineCreated
+            status: 'True'
